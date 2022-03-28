@@ -1,0 +1,502 @@
+#!/share/pkg.7/miniconda/4.9.2/install/bin/python
+
+import os
+import sys
+import subprocess
+import datetime
+import argparse
+
+DEFAULT_MASTER_FILE = '/usr/local/sge/scv/nodes/master'
+
+version = '1.0'
+name = 'IVC SCC tool (ver %s)' % version
+usage = '''\
+DOCUMENTATION
+
+Either always call using the full path `/projectnb2/ivc-ml/usmn/util/qivc` or "install" (add a permanent alias to your bash) as follows:
+
+  $ CMD='alias qivc=/projectnb2/ivc-ml/usmn/util/qivc'; eval $CMD; echo $CMD >> ~/.bashrc
+
+In most cases, you should get all necessary info by running
+
+  $ qivc -a
+
+more specifically, it shows what resources are avaliable on each node, currently running jobs, currently waiting jobs, nodes that could accomodate these waiting jobs, and how many jobs with higher priority are currently scheduled and can run on same nodes as your scheduled job.
+
+Some output columns:
+- `cores`, `gpus`, `gpu_mem`, `gpu_type`, `gpu_cc`, `h_rt` - requested CPU cores, GPUs, and runtime (in hours)
+- `h_run` - for running jobs, how long they were running (in hours), for waiting jobs - how long they have been waiting (in hours)
+- `wait` - for waiting jobs, a list of hosts that can execute this job and your place in the priority queue in the following format:
+
+  host1/05,host2/08,... 
+
+meaning that this job is 5th priority-wise among those that can run on host1 and 8th among those that can run on host2.
+
+If you see that you are in the 5th place on a given host, it does NOT mean that you have to wait for five tasks to finish before your job starts, because these jobs might start on other hosts as well (check their `wait` column)
+
+You can add or remove fields using the `-f` option as follows:
+
+  $ qivc -a -f load_avg=hl:np_load_avg,mem_total=hl:mem_total,mem_used=hl:mem_used,mem_free=hl:mem_free,~gpu_type,~running,~wait
+
+the command above will ADD fields `load_avg` (with value of the `hl:np_load_avg` statistic), `mem_total`, `mem_used` and `mem_free` and REMOVE fields `gpu_type`, `running` and `h_run`. You can see all avaliable options using:
+
+  $ qivc -l
+
+The "verbose" mode shows each hosts' currently allocated resources, jobs running on that host right now, as well as jobs waiting to start that COULD BE started on that host.
+
+USAGE EXAMPLES
+  $ qivc  # show ivc queue resources
+  
+  $ qivc -a  # running and waiting jobs for ALL users and requested resources 
+
+  $ qivc -u <USERNAME>  # same as above but for that USER
+
+Options below provide more details into why certain jobs are not getting allocated:
+
+  $ qivc -v  # show each host + jobs running on that host + jobs waiting that can be executed on that host
+
+  $ qivc -v -j <JOB_ID>  # show either all jobs on the host running this job (for running jobs), or hosts that can run this job and waiting jobs with higher priority also waiting for these hosts (for waiting jobs)
+
+  $ qivc -v -u <USERNAME>  # same as above but for ALL jobs for that USER
+
+CONTACT
+Ben Usman <usmn@bu.edu>
+'''
+
+def run(args):
+  return subprocess.check_output(args).decode('ascii').split('\n')
+
+
+def find_queue_hosts(queue_name):
+  output = run(['qhost', '-q'])
+  queue_hosts = []
+  current_host = None
+  for line in output:
+    if line.startswith(' ' * 3):
+      assert current_host is not None
+      cur_queue = line.strip().split(' ')[0]
+      if cur_queue == queue_name:
+        queue_hosts.append(current_host)
+    else:
+      current_host = line.split(' ')[0]
+  return queue_hosts
+
+
+def get_host_resources(queue_hosts, master_file = DEFAULT_MASTER_FILE):
+  host_data = {}
+  master_columns = (
+      'host processor_type sockets cores memory disk scratch '
+      'eth_speed ib_speed gpu_type gpus flag extra_batch'.split(' '))
+
+  for line in open(master_file):
+    for host in queue_hosts:
+      if line.startswith(host):
+        result = [x for x in line.split(' ') if x]
+        host_data[host] = dict(zip(master_columns[1:], result[1:]))
+
+  output = run(['qhost', '-F', '-h', ','.join(queue_hosts)])
+  current_host = None
+  for line in output:
+    if not line.startswith(' ' * 3):
+      current_host = line.split(' ')[0]
+    else:
+      if current_host == 'global':
+        continue
+      assert current_host is not None
+      key, value = line.strip().split('=')
+      host_data[current_host][key] = value
+
+  return host_data
+
+
+def get_queue_jobs(queue_name):
+  output = run(['qstat', '-r', '-q', queue_name])
+  jobs = {}
+  current_job = None
+  for line in output[2:-1]:
+    if not line.startswith(' '):
+      result = [x for x in line.split(' ') if x]
+      current_job = result[0]
+      fields = ['prior', 'short_name', 'user', 'state', 'at_date', 'at_time']
+      jobs[current_job] = dict(zip(fields, result[1:]))
+      jobs[current_job]['slots'] = result[-1]
+      if len(result) == 9:
+        assert jobs[current_job]['state'] == 'r', jobs[current_job]
+        jobs[current_job]['host'] = result[-2].split('@')[1].split('.')[0]
+      else:
+        jobs[current_job]['host'] = None
+    elif line.strip().startswith('Full jobname'):
+      assert current_job is not None
+      jobs[current_job]['full_name'] = line.split(':')[1].strip()
+    elif line.strip().startswith('Requested PE'):
+      assert current_job is not None
+      jobs[current_job]['omp'] = line.split(':')[1].strip()
+    elif '=' in line:
+      key = line.split('=')[0].split(' ')[-1]
+      value = line.split('=')[1].split(' ')[0]
+      jobs[current_job][key] = value
+    else:
+      pass
+
+  jobs_list = [{'id': k, **v} for k, v in jobs.items() if 'E' not in v['state']]
+  return jobs_list
+
+
+def test_gpu_compat(host_res, job):
+  if 'gpu_compute_capability' in job:
+    if float(host_res['hf:gpu_compute_capability']) < float(job['gpu_compute_capability']):
+      return False
+
+  if 'gpu_memory' in job:
+    assert job['gpu_memory'].endswith('G'), job
+    if int(float(host_res['hf:gpu_memory'][:-1])) < int(float(job['gpu_memory'][:-1])):
+      return False
+
+  if 'gpu_type' in job:
+    if host_res['hf:gpu_type'] not in job['gpu_type'].split('|'):
+      return False
+
+  return True
+
+
+def merge_host_job_data(host_data, job_list, test_compat_fn):
+  merged_host_data = {}
+  for host, resources in host_data.items():
+    current_host_data = {
+        'resources': resources,
+        'jobs': {'running': [], 'waiting': []}
+    }
+    current_host_data['resources']['cpu_avail'] = int(resources['cores'])
+    for job in job_list:
+      if job['host'] == host:
+        current_host_data['jobs']['running'].append(job)
+        current_host_data['resources']['cpu_avail'] -= int(job['slots'])
+      elif job['host'] is None:
+        if test_compat_fn(resources, job):
+          current_host_data['jobs']['waiting'].append(job)
+      else:
+        pass
+
+    merged_host_data[host] = current_host_data
+  return merged_host_data
+
+
+def tabular_print(lines, pad=3, default='-'):
+  list(tabular_print_generator(lines, pad, default))
+
+
+def tabular_print_generator(lines, pad=3, default='-'):
+  header = []
+  for line in lines:
+    for k in line:
+      if k not in header:
+        header.append(k)
+
+  str_lines = [[str(line.get(k, '-')) for k in header] for line in lines]
+  field_lens = [max(map(len, values)) for values in zip(*([header] + str_lines))]
+  column_pad = ' ' * pad
+  fmt = column_pad.join(['%{}s'.format(l) for l in field_lens])
+  print(fmt % tuple(header))
+  print(fmt % tuple(['-' * l for l in field_lens]))
+  for sline in str_lines:
+    print(fmt % tuple(sline))
+    yield sline
+
+
+all_special_fields = ['running', 'waiting', 'wait', 'h_run']
+ignore_special_fields = []
+
+host_resource_name_map = {
+    'cpu_avail': 'cpu_avail',
+    'cpu_total': 'cores',
+    'gpus_avail': 'hc:gpus',
+    'gpus_total': 'gpus',
+    'gpu_cc': 'hf:gpu_compute_capability',
+    'gpu_mem': 'hf:gpu_memory',
+    'gpu_type': 'hf:gpu_type'
+}
+
+host_resource_fn_map = {
+    'gpus_avail': lambda x: int(float(x)),
+    'gpu_cc': float,
+    'gpu_mem': lambda x: int(float(x[:-1]))
+}
+
+def generate_host_lines(merged_job_data):
+  lines = []
+  for host, data in merged_job_data.items():
+    line = {'host': host}
+    for k, v in host_resource_name_map.items():
+      value = data['resources'][v]
+      if k in host_resource_fn_map:
+        value = host_resource_fn_map[k](value)
+      line[k] = value
+
+    if 'running' not in ignore_special_fields:
+      line['running'] = len(data['jobs']['running'])
+    if 'waiting' not in ignore_special_fields:
+      line['waiting'] = len(data['jobs']['waiting'])
+
+    lines.append(line)
+  return lines
+
+job_name_map = {
+    'id': 'id',
+    'user': 'user',
+    'state': 'state',
+    'host': 'host',
+    'prior': 'prior',
+    'short_name': 'short_name',
+    'start_date': 'at_date',
+    'start_time': 'at_time',
+    'cores': 'slots',
+    'gpus': 'gpus',
+    'gpu_mem': 'gpu_memory',
+    'gpu_type': 'gpu_type',
+    'gpu_cc': 'gpu_compute_capability',
+    'h_rt': 'h_rt',
+}
+
+job_map_fns = {
+    'gpu_cc': float,
+    'h_rt': lambda x: int(x) // 60 // 60
+}
+
+def add_current_runtime(line):
+  h_m_s = line['start_time'].split(':')
+  month, day, year = line['start_date'].split('/')
+  data = list(map(int, [year, month, day, *h_m_s]))
+  start = datetime.datetime(*data)
+  dt = datetime.datetime.now() - start
+  hr = int(dt.total_seconds()) // 3600
+  if 'h_run' not in ignore_special_fields:
+    line['h_run'] = hr
+
+def add_wait_strings(job):
+  if 'wait' not in ignore_special_fields:
+    job['wait'] = wait_strings[job['id']]
+
+job_post_run_fn = [add_current_runtime, add_wait_strings]
+
+def generate_job_lines(merged_job_data, job_status):
+  lines = []
+  for host in merged_job_data:
+    for job in merged_job_data[host]['jobs'][job_status]:
+      line = {}
+      for k, v in job_name_map.items():
+        value = job.get(v, '-')
+        if k in job_map_fns and value != '-':
+          value = job_map_fns[k](value)
+        line[k] = value
+
+      for fn in job_post_run_fn:
+        fn(line)
+      
+      line['host'] = host
+      lines.append(line)
+
+  return lines
+
+def rindex(ll, elem):
+  return len(ll) - 1 - ll[::-1].index(elem)
+
+
+def get_wait_strings(jobs, merged_job_data):
+  potential_hosts = {j['id']: [] for j in jobs}
+  for host, host_data in merged_job_data.items():
+    for pos, job in enumerate(host_data['jobs']['waiting']):
+      assert host.startswith('scc-')
+      potential_hosts[job['id']].append((host[4:], pos))
+
+  wait_strings = {}
+  for jid, host_pos in potential_hosts.items():
+    wait_strings[jid] = ','.join(['%s/%02d' % (h, p) for h, p in sorted(host_pos, key=lambda x: x[1])])
+
+  return wait_strings
+
+def generate_summary_job_lines(job_list):
+  lines = []
+  for job in job_list:
+    line = {}
+    for k, v in job_name_map.items():
+      value = job.get(v, '-')
+      if k in job_map_fns and value != '-':
+        value = job_map_fns[k](value)
+      line[k] = value
+
+    for fn in job_post_run_fn:
+      fn(line)
+
+    lines.append(line)
+
+  return lines
+
+
+def print_wait(args, host_lines, queue_hosts, merged_job_data):
+  run_job_lines = generate_job_lines(merged_job_data, 'running')
+  wait_job_lines = generate_job_lines(merged_job_data, 'waiting')
+
+  for host in queue_hosts:
+    host_lines_this_host = [h for h in host_lines if h['host'] == host]
+    running_lines = [j for j in run_job_lines if j['host'] == host]
+    waiting_lines = [j for j in wait_job_lines if j['host'] == host]
+
+    if args.user is not None and args.job is not None:
+      raise ValueError('--user and --job provided at the same time!')
+    elif args.user is None and args.job is None:
+      tabular_print(host_lines_this_host)
+      print()
+      tabular_print(running_lines + [{}] + waiting_lines)
+      print()
+    
+    elif args.user is not None:
+      user_has_running, user_has_waiting = (
+        any(job['user'] == args.user for job in merged_job_data[host]['jobs'][status])
+        for status in ['running', 'waiting'])
+      
+      if not (user_has_running or user_has_waiting):
+        continue
+
+      tabular_print(host_lines_this_host)
+      print()
+
+      if user_has_waiting:
+        last_user_idx = rindex([x['user'] == args.user for x in waiting_lines], True)
+        final_waiting_lines = waiting_lines[:last_user_idx+1]
+        tabular_print(running_lines + [{}] + final_waiting_lines)
+        print('[...]')
+      else:
+        tabular_print(running_lines)
+        print(host, '[no waiting]')
+      print()
+    elif args.job is not None:
+      is_running, is_waiting = (
+        any(job['id'] == args.job for job in merged_job_data[host]['jobs'][status])
+        for status in ['running', 'waiting'])
+      
+      if is_running or is_waiting:
+        tabular_print(host_lines_this_host)
+        print()
+      else:
+        continue
+
+      if is_waiting:
+        last_user_idx = rindex([x['id'] == args.job for x in waiting_lines], True)
+        lines = waiting_lines[:last_user_idx+1]
+        tabular_print(running_lines + [{}] + lines)
+        print('[...]')
+        print()
+      else:
+        tabular_print(running_lines)
+        print()
+    else:
+      assert False
+
+
+def get_fields(jobs, host_data):
+  job_fields = set()
+  for j in jobs:
+    job_fields.update(list(j.keys()))
+
+  host_fields = set()
+  for h in host_data.values():
+    host_fields.update(list(h.keys()))
+  return job_fields, host_fields
+
+
+def update_fields(fields, job_fields, host_fields):
+  for field in fields.split(','):
+    if '=' in field:
+      present = False
+      k, v = field.split('=')
+
+      if v in job_fields:
+        job_name_map[k] = v
+        present = True
+
+      if v in host_fields:
+        host_resource_name_map[k] = v
+        present = True
+
+      if not present:
+        raise RuntimeError('field "%s" not found in available fields' % v)
+
+    elif field.startswith('~'):
+      present = False
+
+      if field[1:] in job_name_map:
+        del job_name_map[field[1:]]
+        present = True
+
+      if field[1:] in host_resource_name_map:
+        del host_resource_name_map[field[1:]]
+        present = True
+      
+      if field[1:] in all_special_fields:
+        ignore_special_fields.append(field[1:])
+        present = True
+
+      if not present:
+        raise RuntimeError('field "%s" not found in current fields' % field[1:])
+
+    else:
+      raise RuntimeError('each field directive should be either a=b or ~c, got %s' % field)
+
+
+def main():
+  global wait_strings
+  parser = argparse.ArgumentParser(description=name, epilog=usage, formatter_class=argparse.RawDescriptionHelpFormatter)
+  parser.add_argument('-q', '--queue', default='ivcbuyin', help='(default: ivcbuyin)')
+  parser.add_argument('-u', '--user', default=None, help='username')
+  parser.add_argument('-a', '--all', action='store_true', help='show for all users')
+  parser.add_argument('-j', '--job', default=None, help='show verbose for a specific job')
+  parser.add_argument('-v', '--verbose', action='store_true', help='show verbose details for all jobs')
+  parser.add_argument('-l', '--listfields', action='store_true', help='list all avaliable output fields')
+  parser.add_argument('-f', '--fields', default=None, help='add or remove output fields')
+
+  args = parser.parse_args()
+  queue_name = args.queue
+  queue_hosts = find_queue_hosts(queue_name)
+  host_data = get_host_resources(queue_hosts)
+  jobs = get_queue_jobs(queue_name)
+  job_fields, host_fields = get_fields(jobs, host_data)
+
+  if args.fields is not None:
+    update_fields(args.fields, job_fields, host_fields)    
+
+  merged_job_data = merge_host_job_data(host_data, jobs, test_gpu_compat)
+  host_lines = generate_host_lines(merged_job_data)
+  wait_strings = get_wait_strings(jobs, merged_job_data)
+
+  if args.listfields:
+    print('= job fields: ')
+    print('current: ', ','.join(['%s=%s' % k_v for k_v in job_name_map.items()]))
+    print('available:', ', '.join(job_fields))
+    print('= host fields: ')
+    print('current: ', ','.join(['%s=%s' % k_v for k_v in host_resource_name_map.items()]))
+    print('available:', ', '.join(host_fields))
+    print('= special fields:', ', '.join(all_special_fields))
+    return
+
+  if not args.verbose:
+    tabular_print(host_lines)
+
+    if args.all:
+      print(); print()
+      tabular_print(generate_summary_job_lines(jobs))
+      return
+
+    if args.user is not None:
+      print(); print()
+      tabular_print(generate_summary_job_lines([j for j in jobs if j['user'] == args.user]))
+
+    return
+
+  run_job_lines = generate_job_lines(merged_job_data, 'running')
+  wait_job_lines = generate_job_lines(merged_job_data, 'waiting')
+  print_wait(args, host_lines, queue_hosts, merged_job_data)
+
+if __name__ == '__main__':
+  with open('/projectnb/ivc-ml/usmn/qivc-usage.txt', 'a') as f:
+    f.write('%s %s %s\n' % (os.environ['USER'], datetime.datetime.now(), ' '.join(sys.argv)))
+  main()
